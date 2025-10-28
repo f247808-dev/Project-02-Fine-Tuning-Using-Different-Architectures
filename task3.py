@@ -39,13 +39,18 @@ print("Test shape:", test_df.shape)
 
 train_df.head()
 
-!pip install transformers datasets torch evaluate
 
+!pip install transformers datasets torch evaluate rouge-score
+
+import os
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
-from transformers import BartTokenizer, BartForConditionalGeneration
+from torch.utils.data import Dataset, DataLoader
+from transformers import T5Tokenizer, T5ForConditionalGeneration
+from torch.optim import AdamW
 from tqdm import tqdm
+from rouge_score import rouge_scorer
+
 
 base_path = "/content/cnn_dailymail_data/cnn_dailymail"
 
@@ -53,12 +58,11 @@ train_df = pd.read_csv(f"{base_path}/train.csv", engine='python', on_bad_lines='
 val_df   = pd.read_csv(f"{base_path}/validation.csv", engine='python', on_bad_lines='skip')
 test_df  = pd.read_csv(f"{base_path}/test.csv", engine='python', on_bad_lines='skip')
 
-print("Train shape:", train_df.shape)
-print("Validation shape:", val_df.shape)
-print("Test shape:", test_df.shape)
+print("Train:", train_df.shape, "Validation:", val_df.shape, "Test:", test_df.shape)
 
-tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
-model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
+
+tokenizer = T5Tokenizer.from_pretrained("t5-small")
+model = T5ForConditionalGeneration.from_pretrained("t5-small")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model = model.to(device)
@@ -66,27 +70,71 @@ model = model.to(device)
 max_input_length = 512
 max_output_length = 128
 
-def encode(batch):
-    inputs = tokenizer(batch['article'], truncation=True, padding="max_length", max_length=max_input_length, return_tensors="pt")
-    targets = tokenizer(batch['highlights'], truncation=True, padding="max_length", max_length=max_output_length, return_tensors="pt")
-    return {'input_ids': inputs.input_ids.squeeze(), 'attention_mask': inputs.attention_mask.squeeze(), 'labels': targets.input_ids.squeeze()}
 
-subset_size = 1000
-train_data = [encode(row) for i, row in train_df.head(subset_size).iterrows()]
-val_data   = [encode(row) for i, row in val_df.head(200).iterrows()]
+class SummarizationDataset(Dataset):
+    def __init__(self, articles, summaries, tokenizer, max_input_len=512, max_output_len=128):
+        self.articles = articles
+        self.summaries = summaries
+        self.tokenizer = tokenizer
+        self.max_input_len = max_input_len
+        self.max_output_len = max_output_len
 
-train_loader = DataLoader(train_data, batch_size=4, shuffle=True)
-val_loader   = DataLoader(val_data, batch_size=4)
+    def __len__(self):
+        return len(self.articles)
 
-from torch.optim import AdamW
+    def __getitem__(self, idx):
+        input_text = "summarize: " + str(self.articles[idx])
+        target_text = str(self.summaries[idx])
+
+        encoding = self.tokenizer(
+            input_text,
+            max_length=self.max_input_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+        target_encoding = self.tokenizer(
+            target_text,
+            max_length=self.max_output_len,
+            padding="max_length",
+            truncation=True,
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids": encoding.input_ids.squeeze(),
+            "attention_mask": encoding.attention_mask.squeeze(),
+            "labels": target_encoding.input_ids.squeeze()
+        }
+
+subset_train = 1000  
+subset_val   = 200
+
+train_dataset = SummarizationDataset(
+    train_df['article'].head(subset_train).tolist(),
+    train_df['highlights'].head(subset_train).tolist(),
+    tokenizer
+)
+
+val_dataset = SummarizationDataset(
+    val_df['article'].head(subset_val).tolist(),
+    val_df['highlights'].head(subset_val).tolist(),
+    tokenizer
+)
+
+train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=4)
 
 optimizer = AdamW(model.parameters(), lr=5e-5)
-model.train()
+epochs = 3
 
-for epoch in range(3):
+model.train()
+for epoch in range(epochs):
     loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+    total_loss = 0
     for batch in loop:
         optimizer.zero_grad()
+
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
@@ -96,33 +144,22 @@ for epoch in range(3):
         loss.backward()
         optimizer.step()
 
+        total_loss += loss.item()
         loop.set_postfix(loss=loss.item())
 
+    print(f"Epoch {epoch+1} Average Loss: {total_loss/len(train_loader):.4f}")
+
+scorer = rouge_scorer.RougeScorer(['rouge1','rouge2','rougeL'], use_stemmer=True)
 model.eval()
-sample_articles = test_df['article'].head(3).tolist()
 
-for article in sample_articles:
-    inputs = tokenizer(article, return_tensors="pt", truncation=True, max_length=max_input_length).to(device)
-    summary_ids = model.generate(inputs['input_ids'], max_length=128, num_beams=4, early_stopping=True)
-    summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
-    print("\nArticle:\n", article[:500], "...\n")
-    print("Generated Summary:\n", summary)
-
-!pip install rouge-score
-from rouge_score import rouge_scorer
-
-scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
-
-model.eval()
-all_scores = {'rouge1': [], 'rouge2': [], 'rougeL': []}
+all_scores = {"rouge1": [], "rouge2": [], "rougeL": []}
 
 for batch in tqdm(val_loader, desc="Evaluating"):
     input_ids = batch['input_ids'].to(device)
     attention_mask = batch['attention_mask'].to(device)
     labels = batch['labels'].to(device)
 
-
-    summaries_ids = model.generate(input_ids, max_length=80, num_beams=4, early_stopping=True)
+    summaries_ids = model.generate(input_ids, max_length=128, num_beams=4, early_stopping=True)
     preds = [tokenizer.decode(g, skip_special_tokens=True) for g in summaries_ids]
     refs = [tokenizer.decode(l, skip_special_tokens=True) for l in labels]
 
@@ -132,40 +169,29 @@ for batch in tqdm(val_loader, desc="Evaluating"):
         all_scores['rouge2'].append(scores['rouge2'].fmeasure)
         all_scores['rougeL'].append(scores['rougeL'].fmeasure)
 
-# Compute average ROUGE scores
-avg_rouge1 = sum(all_scores['rouge1']) / len(all_scores['rouge1'])
-avg_rouge2 = sum(all_scores['rouge2']) / len(all_scores['rouge2'])
-avg_rougeL = sum(all_scores['rougeL']) / len(all_scores['rougeL'])
+avg_rouge1 = sum(all_scores['rouge1'])/len(all_scores['rouge1'])
+avg_rouge2 = sum(all_scores['rouge2'])/len(all_scores['rouge2'])
+avg_rougeL = sum(all_scores['rougeL'])/len(all_scores['rougeL'])
 
-print(f"ROUGE-1: {avg_rouge1:.4f}")
-print(f"ROUGE-2: {avg_rouge2:.4f}")
-print(f"ROUGE-L: {avg_rougeL:.4f}")
+print(f"\nAverage ROUGE-1: {avg_rouge1:.4f}")
+print(f"Average ROUGE-2: {avg_rouge2:.4f}")
+print(f"Average ROUGE-L: {avg_rougeL:.4f}")
 
-from transformers import BartTokenizer, BartForConditionalGeneration
-import torch
 
-tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
-model = BartForConditionalGeneration.from_pretrained("facebook/bart-base")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-model = model.to(device)
-model.eval()
-
-examples = val_df[['article', 'highlights']].head(5)
+examples = val_df[['article','highlights']].head(5)
 
 for i, row in examples.iterrows():
     article = row['article']
     reference = row['highlights']
 
-    inputs = tokenizer(article, return_tensors="pt", max_length=1024, truncation=True).to(device)
-    summary_ids = model.generate(
-        inputs.input_ids,
-        num_beams=4,
-        max_length=100,
-        early_stopping=True
-    )
+    inputs = tokenizer("summarize: " + article, return_tensors="pt", max_length=512, truncation=True).to(device)
+    summary_ids = model.generate(inputs.input_ids, max_length=128, num_beams=4, early_stopping=True)
     summary = tokenizer.decode(summary_ids[0], skip_special_tokens=True)
 
     print(f"\n--- Example {i+1} ---")
-    print("Original Article:\n", article[:500], "...")  # show first 500 chars
-    print("\nReference Summary:\n", reference)
-    print("\nGenerated Summary:\n", summary)
+    print("Original Article:\n", article[:500], "...")
+    print("Reference Summary:\n", reference)
+    print("Generated Summary:\n", summary)
+
+model.save_pretrained("t5_cnn_dailymail_model")
+tokenizer.save_pretrained("t5_cnn_dailymail_model")
